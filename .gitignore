@@ -1,0 +1,27 @@
+# ── 构建产物 ───────────────────────────────────────────────
+/build/
+compile_commands.json
+
+# ── IDE / 编辑器 ───────────────────────────────────────────
+.idea/
+.vs/
+.vscode/
+*.iml
+
+# ── Reasonix 运行时 ────────────────────────────────────────
+/.reasonix/
+
+# ── AI 工具本地配置 ────────────────────────────────────────
+.codex/
+
+# ── Android ───────────────────────────────────────────────
+/Android/.gradle/
+/Android/build/
+/Android/app/build/
+/Android/app/.cxx/
+/Android/local.properties
+*.apk
+# 注意：Android/app/libs/SDL3-*.aar 是构建必需的依赖，故意不忽略
+
+# ── 运行时生成 ─────────────────────────────────────────────
+imgui.ini
