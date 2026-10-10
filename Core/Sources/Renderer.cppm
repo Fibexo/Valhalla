@@ -3,6 +3,14 @@ module;
 #include <atomic>
 #include <cstdio>
 #include <vector>
+
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <chrono>
+#include <glm/glm.hpp>
+#include <glm/ext.hpp>
+
+#include <vma/vk_mem_alloc.h>
+
 #include <vulkan/vulkan_raii.hpp>
 #include <imgui_impl_vulkan.h>
 
@@ -52,7 +60,26 @@ export class Renderer
 	vk::raii::DescriptorPool imGuiDescriptorPool{nullptr};
 
 	constexpr static size_t maxFrameInFlight = 2;
+	size_t frame = 0;
+	[[nodiscard]] auto currentSlot() const { return frame % maxFrameInFlight; }
 
+
+	struct RenderData
+	{
+		glm::mat4 mvp{};
+		glm::vec4 color{};
+	};
+
+	struct PushedData
+	{
+		vk::DeviceAddress data;
+	};
+
+	VmaAllocator allocator{nullptr};
+	std::array<VkBuffer, maxFrameInFlight> buffers{nullptr, nullptr};
+	std::array<VmaAllocation, maxFrameInFlight> bufferMemory{nullptr, nullptr};
+	std::array<RenderData*, maxFrameInFlight> mappedMemory{};
+	std::array<vk::DeviceAddress, maxFrameInFlight> bufferAddress{};
 
 	float Colors[4] = {1.0f, 0.0f, 1.0f, 1.0f};
 
@@ -63,6 +90,8 @@ public:
 		CreateSurface();
 		InitializeDevice();
 		CreateSwapchain();
+		CreateAllocator();
+		CreateBuffers();
 		CreatePipeline();
 
 		Logger->Log("Renderer initializing.");
@@ -71,6 +100,17 @@ public:
 	~Renderer()
 	{
 		device.waitIdle();
+
+		for (size_t i = 0; i < maxFrameInFlight; ++i)
+		{
+			if (buffers[i] != VK_NULL_HANDLE)
+			{
+				vmaDestroyBuffer(allocator, buffers[i], bufferMemory[i]);
+				buffers[i] = VK_NULL_HANDLE;
+			}
+		}
+		if (allocator != VK_NULL_HANDLE) { vmaDestroyAllocator(allocator); }
+
 		Logger->Log("Renderer shutting down.");
 	}
 
@@ -84,9 +124,13 @@ private:
 	void CreateSurface();
 	void InitializeDevice();
 	void CreateSwapchain();
+	void CreateAllocator();
+	void CreateBuffers();
 	void CreatePipeline();
 
+
 	void RenderGUI();
+	void Process();
 };
 
 void Renderer::RenderGUI()
@@ -96,9 +140,20 @@ void Renderer::RenderGUI()
 	ImGui::SliderFloat4("Color", Colors, 0.0f, 1.0f);
 }
 
+void Renderer::Process()
+{
+	static const auto start = std::chrono::system_clock::now();
+
+	auto& data = *mappedMemory[currentSlot()];
+	const auto delta = (std::chrono::system_clock::now() - start).count() * 0.000001f;
+	const auto angle = delta * glm::pi<float>() / 3;
+
+	data.mvp = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 0.0f, 1.0f));
+	data.color = glm::vec4(Colors[0] / 2, Colors[1] / 2, Colors[2] / 2, Colors[3]);
+}
+
 void Renderer::Render()
 {
-	static size_t frame = 0;
 	if (device == nullptr) { return; }
 	if (surface == nullptr) { CreateSurface(); }
 	if (swapchain == nullptr) { ResetSwapchain(); }
@@ -172,7 +227,9 @@ void Renderer::Render()
 		0.f, 0.f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.f, 1.f
 	};
 
-	const auto& command = commandBuffers[frame % maxFrameInFlight];
+	Process();
+
+	const auto& command = commandBuffers[currentSlot()];
 	command.reset();
 
 	command.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
@@ -180,6 +237,9 @@ void Renderer::Render()
 	command.beginRendering(ri);
 
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+	command.pushConstants<PushedData>(*pipelineLayout, vk::ShaderStageFlagBits::eVertex |
+	                                  vk::ShaderStageFlagBits::eFragment, 0,
+	                                  PushedData{bufferAddress[currentSlot()]});
 	command.setViewport(0, vp);
 	command.setScissor(0, vk::Rect2D{{0, 0}, extent});
 
@@ -225,7 +285,7 @@ void Renderer::Render()
 
 	const vk::Result present_result = queue.presentKHR(pi);
 	if (present_result == vk::Result::eErrorOutOfDateKHR ||
-	    present_result == vk::Result::eSuboptimalKHR)
+		present_result == vk::Result::eSuboptimalKHR)
 	{
 		ResetSwapchain();
 		return;
@@ -297,7 +357,8 @@ void Renderer::InitializeDevice()
 			vk::PhysicalDeviceVulkan11Features{}
 			.setShaderDrawParameters(true),
 			vk::PhysicalDeviceVulkan12Features{}
-			.setTimelineSemaphore(true),
+			.setTimelineSemaphore(true)
+			.setBufferDeviceAddress(true),
 			vk::PhysicalDeviceVulkan13Features{}
 			.setDynamicRendering(true)
 			.setSynchronization2(true)
@@ -411,16 +472,29 @@ void Renderer::CreateSwapchain()
 	}
 }
 
+void Renderer::CreateAllocator()
+{
+	const auto ci = VmaAllocatorCreateInfo{
+		.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+		.physicalDevice = *physicalDevice,
+		.device = *device,
+		.instance = *instance,
+		.vulkanApiVersion = VK_API_VERSION_1_4
+	};
+	vmaCreateAllocator(&ci, &allocator);
+}
+
 void Renderer::CreatePipeline()
 {
 	vk::raii::ShaderModule vert{device, vk::ShaderModuleCreateInfo{}.setCode(Shaders::ShaderVertex)};
 	vk::raii::ShaderModule frag{device, vk::ShaderModuleCreateInfo{}.setCode(Shaders::ShaderFragment)};
 
-	const std::vector<vk::PipelineShaderStageCreateInfo> stages{
+	const std::vector stages{
 		vk::PipelineShaderStageCreateInfo{}
-			.setStage(vk::ShaderStageFlagBits::eVertex).setModule(*vert).setPName("vsMain"),
+		.setStage(vk::ShaderStageFlagBits::eVertex)
+		.setModule(*vert).setPName("vsMain"),
 		vk::PipelineShaderStageCreateInfo{}
-			.setStage(vk::ShaderStageFlagBits::eFragment).setModule(*frag).setPName("fsMain"),
+		.setStage(vk::ShaderStageFlagBits::eFragment).setModule(*frag).setPName("fsMain"),
 	};
 
 	constexpr auto vin = vk::PipelineVertexInputStateCreateInfo{}; // 无顶点输入
@@ -443,11 +517,19 @@ void Renderer::CreatePipeline()
 	const auto cb = vk::PipelineColorBlendStateCreateInfo{}
 		.setAttachments(cba); // 单个元素可直接传对象
 
-	const std::vector<vk::DynamicState> dynStates{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
-	const auto ds = vk::PipelineDynamicStateCreateInfo{}
-		.setDynamicStates(dynStates); // 值版：count 由容器长度推导
+	const std::vector<vk::DynamicState> ds{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	const auto dsci = vk::PipelineDynamicStateCreateInfo{}
+		.setDynamicStates(ds); // 值版：count 由容器长度推导
+	constexpr auto pcr = vk::PushConstantRange{}
+	                     .setStageFlags(vk::ShaderStageFlagBits::eVertex |
+		                     vk::ShaderStageFlagBits::eFragment)
+	                     .setOffset(0)
+	                     .setSize(sizeof(vk::DeviceAddress)); // 8
 
-	pipelineLayout = vk::raii::PipelineLayout{device, vk::PipelineLayoutCreateInfo{}};
+	pipelineLayout = vk::raii::PipelineLayout{
+		device, vk::PipelineLayoutCreateInfo{}
+		.setPushConstantRanges(pcr)
+	}; // 没有 setSetLayouts
 
 	// 显式给出模板参数并默认构造，再用 get<>() 逐字段设置。
 	// 不要用 vk::StructureChain{ A{...}, B{...} } 这种 CTAD + 花括号的形式 ——
@@ -457,27 +539,53 @@ void Renderer::CreatePipeline()
 
 	auto& gp = chain.get<vk::GraphicsPipelineCreateInfo>();
 	gp.setStages(stages) // 值版：stageCount 由容器长度推导
-		.setPVertexInputState(&vin)
-		.setPInputAssemblyState(&ia)
-		.setPViewportState(&vp)
-		.setPRasterizationState(&rs)
-		.setPMultisampleState(&ms)
-		.setPColorBlendState(&cb)
-		.setPDynamicState(&ds)
-		.setLayout(*pipelineLayout);
+	  .setPVertexInputState(&vin)
+	  .setPInputAssemblyState(&ia)
+	  .setPViewportState(&vp)
+	  .setPRasterizationState(&rs)
+	  .setPMultisampleState(&ms)
+	  .setPColorBlendState(&cb)
+	  .setPDynamicState(&dsci)
+	  .setLayout(*pipelineLayout);
 
 	chain.get<vk::PipelineRenderingCreateInfo>()
-		.setColorAttachmentCount(1)
-		.setPColorAttachmentFormats(&format);
+	     .setColorAttachmentCount(1)
+	     .setPColorAttachmentFormats(&format);
 
 	pipeline = vk::raii::Pipeline{device, nullptr, chain.get<vk::GraphicsPipelineCreateInfo>()};
 }
 
+void Renderer::CreateBuffers()
+{
+	for (size_t i = 0; i < maxFrameInFlight; ++i)
+	{
+		constexpr vk::DeviceSize size = sizeof(RenderData);
+		VkBufferCreateInfo bi{
+			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+			.size = size,
+			.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+			VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+			.sharingMode = VK_SHARING_MODE_EXCLUSIVE
+		};
+
+		VmaAllocationCreateInfo ai{
+			.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+			VMA_ALLOCATION_CREATE_MAPPED_BIT,
+			.usage = VMA_MEMORY_USAGE_AUTO
+		};
+
+		VmaAllocationInfo info{};
+		vmaCreateBuffer(allocator, &bi, &ai, &buffers[i], &bufferMemory[i], &info);
+
+		mappedMemory[i] = static_cast<RenderData*>(info.pMappedData);
+		bufferAddress[i] = device.getBufferAddress(vk::BufferDeviceAddressInfo{}.setBuffer(buffers[i])); // ★ 取 64 位设备地址
+	}
+}
 
 void Renderer::ResetSwapchain()
 {
 	static std::atomic_flag resetting{};
-	if (resetting.test_and_set()) { return; }   // 返回 true = 已有调用在重置中 → 这次退出
+	if (resetting.test_and_set()) { return; } // 返回 true = 已有调用在重置中 → 这次退出
 
 	device.waitIdle();
 	swapchain = nullptr;

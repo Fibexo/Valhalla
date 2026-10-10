@@ -1,4 +1,4 @@
-file(GLOB_RECURSE SHADERS CONFIGURE_DEPENDS src/*.slang)
+file(GLOB_RECURSE SHADERS CONFIGURE_DEPENDS Sources/*.slang)
 
 set(SHADER_INCLUDES "")
 set(SHADER_DECLS "")
@@ -13,13 +13,14 @@ foreach (SHADER_SRC IN LISTS SHADERS)
         list(GET kv 1 suffix)
 
         set(sym "${shader_name}${suffix}")                                   # FooVertex / FooFragment
-        set(out "${CMAKE_CURRENT_BINARY_DIR}/generated/${shader_name}${suffix}.g.h")   # slangc 生成的定义
+        set(out "${CMAKE_CURRENT_BINARY_DIR}/Generated/${shader_name}${suffix}.g.h")   # slangc 生成的定义
 
         message(STATUS "slangc ${shader_name}:${entry} → ${out}.h@${sym}")
         add_custom_command(OUTPUT "${out}"
                 COMMAND "slangc" "${SHADER_SRC}"
                 -target spirv -profile spirv_1_4
                 -entry "${entry}"
+                -matrix-layout-column-major
                 -source-embed-style u32
                 -source-embed-name "${sym}"
                 -fvk-use-entrypoint-name
@@ -32,9 +33,9 @@ foreach (SHADER_SRC IN LISTS SHADERS)
 endforeach ()
 
 # 汇总头：使用侧只 include 这一个
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/Shaders.g.h" "${SHADER_INCLUDES}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/Generated/Shaders.g.h" "${SHADER_INCLUDES}")
 
 
-add_library(Shaders STATIC ${SHADER_HEADERS} ${CMAKE_CURRENT_BINARY_DIR}/generated/Shaders.g.h src/Shaders.hpp src/Shaders.cpp)
-target_include_directories(Shaders PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/generated/"
-        PUBLIC src)
+add_library(Shaders STATIC ${SHADER_HEADERS} ${CMAKE_CURRENT_BINARY_DIR}/Generated/Shaders.g.h Sources/Shaders.hpp Sources/Shaders.cpp)
+target_include_directories(Shaders PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/Generated/"
+        PUBLIC Sources)

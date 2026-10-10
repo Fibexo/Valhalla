@@ -1,6 +1,6 @@
 find_package(SDL3 CONFIG REQUIRED)
 
-file(GLOB_RECURSE MODULES CONFIGURE_DEPENDS src/*.cppm)
+file(GLOB_RECURSE MODULES CONFIGURE_DEPENDS Sources/*.cppm)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     # SDLActivity.java 按固定名字 "main" 加载原生库，所以产物必须是 libmain.so
@@ -13,9 +13,9 @@ else ()
 endif ()
 
 
-target_sources(Valhalla PRIVATE src/main.cpp
+target_sources(Valhalla PRIVATE Sources/main.cpp
         PUBLIC FILE_SET CXX_MODULES
-        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/Sources
         FILES ${MODULES}
 )
 target_link_libraries(Valhalla PRIVATE SDL3::SDL3 Core)
