@@ -16,6 +16,7 @@ module;
 export module Renderer;
 
 import Logger;
+import PushStructures;
 
 export class SurfaceSource
 {
@@ -60,35 +61,32 @@ export class Renderer
 	size_t frame = 0;
 	[[nodiscard]] auto currentSlot() const { return frame % maxFrameInFlight; }
 
-
-	struct RenderData
-	{
-		glm::mat4 mvp{};
-		glm::vec4 color{};
-		uint32_t textureIndex{0};
-		uint32_t padding[3]{}; // 对齐到 16 字节边界（与 shader 侧数组步长一致）
-	};
-
-	struct PushedData
-	{
-		vk::DeviceAddress data;
-	};
-
 	vma::raii::Allocator allocator{nullptr};
 	std::array<vma::raii::Buffer, maxFrameInFlight> buffers{nullptr, nullptr};
 	std::array<RenderData*, maxFrameInFlight> mappedMemory{};
 	std::array<vk::DeviceAddress, maxFrameInFlight> bufferAddress{};
 
+	vma::raii::Buffer vertexBuffer{nullptr};
+	vma::raii::Buffer indexBuffer{nullptr};
+	vk::DeviceAddress vertexAddress{0};
+	vk::DeviceAddress indexAddress{0};
+
+	vma::raii::Image depthImage{nullptr};
+	vk::raii::ImageView depthView{nullptr};
+
 	vma::raii::Image textureImage{nullptr};
 	vk::raii::ImageView textureView{nullptr};
 	vk::raii::Sampler textureSampler{nullptr};
-
 	static constexpr uint32_t maxTextures = 1024; // bindless 数组上限
 	vk::raii::DescriptorSetLayout textureSetLayout{nullptr};
 	vk::raii::DescriptorPool texturePool{nullptr};
 	vk::raii::DescriptorSet textureSet{nullptr};
 
-	float Colors[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+	// 相机参数（ImGui 里实时调）
+	float cameraFov{45.0f};
+	float cameraDistance{3.0f};
+
+	float Colors[4] = {0.2f, 0.35f, 0.4f, 1.0f};
 
 public:
 	explicit Renderer(SurfaceSource& surfaceSource) : surfaceSource(surfaceSource)
@@ -99,6 +97,8 @@ public:
 		CreateSwapchain();
 		CreateAllocator();
 		CreateBuffers();
+		CreateVertexBuffer();
+		CreateDepthBuffer();
 		CreateTexture();
 		CreateTextureSetLayout();
 		CreateTextureDescriptors();
@@ -125,6 +125,8 @@ private:
 	void CreateSwapchain();
 	void CreateAllocator();
 	void CreateBuffers();
+	void CreateVertexBuffer();
+	void CreateDepthBuffer();
 	void CreateTexture();
 	void CreateTextureSetLayout();
 	void CreateTextureDescriptors();
@@ -161,6 +163,20 @@ void Renderer::Render()
 		ResetSwapchain();
 		return;
 	}
+	constexpr auto depth_range = vk::ImageSubresourceRange{}
+	                             .setAspectMask(vk::ImageAspectFlagBits::eDepth)
+	                             .setBaseMipLevel(0).setLevelCount(1)
+	                             .setBaseArrayLayer(0).setLayerCount(1);
+
+	const auto depth_barrier = vk::ImageMemoryBarrier2{}
+	                           .setSrcStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests)
+	                           .setDstStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests)
+	                           .setSrcAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
+	                           .setDstAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
+	                           .setOldLayout(vk::ImageLayout::eUndefined)
+	                           .setNewLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+	                           .setImage(*depthImage)
+	                           .setSubresourceRange(depth_range);
 
 	const auto begin_barrier = vk::ImageMemoryBarrier2{}
 	                           .setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
@@ -178,7 +194,8 @@ void Renderer::Render()
 		                           .setBaseArrayLayer(0)
 		                           .setLayerCount(1)
 	                           );
-	const auto begin_di = vk::DependencyInfo{}.setImageMemoryBarriers(begin_barrier);
+	auto barriers = {begin_barrier, depth_barrier};
+	const auto begin_di = vk::DependencyInfo{}.setImageMemoryBarriers(barriers);
 	const auto color_attachment = vk::RenderingAttachmentInfo{}
 	                              .setImageView(views[image_index])
 	                              .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
@@ -187,9 +204,17 @@ void Renderer::Render()
 	                              .setClearValue(vk::ClearValue{
 		                              vk::ClearColorValue{Colors[0], Colors[1], Colors[2], Colors[3]}
 	                              });
+	const auto depth_attachment = vk::RenderingAttachmentInfo{}
+	                              .setImageView(*depthView)
+	                              .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+	                              .setLoadOp(vk::AttachmentLoadOp::eClear)
+	                              .setStoreOp(vk::AttachmentStoreOp::eStore)
+	                              .setClearValue(vk::ClearValue{vk::ClearDepthStencilValue{1.0f, 0}}); // 1.0 = 最远
+
 	const auto ri = vk::RenderingInfo{}
 	                .setRenderArea(vk::Rect2D{{0, 0}, extent})
 	                .setColorAttachments(color_attachment)
+	                .setPDepthAttachment(&depth_attachment)
 	                .setLayerCount(1);
 	const auto end_barrier = vk::ImageMemoryBarrier2{}
 	                         .setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
@@ -223,13 +248,17 @@ void Renderer::Render()
 
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 	command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipelineLayout, 0, *textureSet, {});
-	command.pushConstants<PushedData>(*pipelineLayout, vk::ShaderStageFlagBits::eVertex |
-	                                  vk::ShaderStageFlagBits::eFragment, 0,
-	                                  PushedData{bufferAddress[currentSlot()]});
+	command.pushConstants<PushConstants>(*pipelineLayout, vk::ShaderStageFlagBits::eVertex |
+	                                     vk::ShaderStageFlagBits::eFragment, 0,
+	                                     PushConstants{
+		                                     .data = reinterpret_cast<RenderData*>(bufferAddress[currentSlot()]),
+		                                     .vertices = reinterpret_cast<Vertex*>(vertexAddress),
+		                                     .indices = reinterpret_cast<glm::uint*>(indexAddress)
+	                                     });
 	command.setViewport(0, vp);
 	command.setScissor(0, vk::Rect2D{{0, 0}, extent});
 
-	command.draw(6, 1, 0, 0);
+	command.draw(36, 1, 0, 0);
 
 	ImGui::NewFrame();
 	RenderGUI();
@@ -305,7 +334,8 @@ void Renderer::InitializeImGui()
 	info.UseDynamicRendering = true;
 	info.PipelineInfoMain = {
 		.PipelineRenderingCreateInfo = vk::PipelineRenderingCreateInfo{}
-		.setColorAttachmentFormats({format})
+		                               .setColorAttachmentFormats({format})
+		                               .setDepthAttachmentFormat(vk::Format::eD32Sfloat)
 	};
 	ImGui_ImplVulkan_Init(&info);
 }
@@ -319,10 +349,14 @@ void Renderer::ResetSwapchain()
 {
 	static std::atomic_flag resetting{};
 	if (resetting.test_and_set()) { return; } // 返回 true = 已有调用在重置中 → 这次退出
-
 	device.waitIdle();
+
+	depthView = nullptr;
+	depthImage = nullptr;
+
 	swapchain = nullptr;
 	CreateSwapchain();
+	CreateDepthBuffer();
 	resetting.clear();
 }
 
@@ -544,6 +578,86 @@ void Renderer::CreateBuffers()
 	}
 }
 
+void Renderer::CreateVertexBuffer()
+{
+	// 24 顶点：每面 4 个（左下→右下→右上→左上），UV 覆盖 0..1
+	constexpr Vertex vertices[24] = {
+		{{1, -1, -1, 1}, {0, 1}}, {{1, -1, 1, 1}, {1, 1}}, {{1, 1, 1, 1}, {1, 0}}, {{1, 1, -1, 1}, {0, 0}}, // +X
+		{{-1, -1, 1, 1}, {0, 1}}, {{-1, -1, -1, 1}, {1, 1}}, {{-1, 1, -1, 1}, {1, 0}}, {{-1, 1, 1, 1}, {0, 0}}, // -X
+		{{-1, 1, -1, 1}, {0, 1}}, {{1, 1, -1, 1}, {1, 1}}, {{1, 1, 1, 1}, {1, 0}}, {{-1, 1, 1, 1}, {0, 0}}, // +Y
+		{{-1, -1, 1, 1}, {0, 1}}, {{1, -1, 1, 1}, {1, 1}}, {{1, -1, -1, 1}, {1, 0}}, {{-1, -1, -1, 1}, {0, 0}}, // -Y
+		{{-1, -1, 1, 1}, {0, 1}}, {{1, -1, 1, 1}, {1, 1}}, {{1, 1, 1, 1}, {1, 0}}, {{-1, 1, 1, 1}, {0, 0}}, // +Z
+		{{1, -1, -1, 1}, {0, 1}}, {{-1, -1, -1, 1}, {1, 1}}, {{-1, 1, -1, 1}, {1, 0}}, {{1, 1, -1, 1}, {0, 0}}, // -Z
+	};
+
+	// 36 索引：每面 2 个三角形
+	constexpr uint32_t indices[36] = {
+		0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7,
+		8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15,
+		16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
+	};
+
+	vma::AllocationCreateInfo ai{};
+	ai.usage = vma::MemoryUsage::eAuto;
+	ai.flags = vma::AllocationCreateFlagBits::eHostAccessSequentialWrite |
+		vma::AllocationCreateFlagBits::eMapped;
+
+	// 顶点：BDA 读，所以要 ShaderDeviceAddress
+	vertexBuffer = allocator.createBuffer(
+		vk::BufferCreateInfo{}
+		.setSize(sizeof(vertices))
+		.setUsage(vk::BufferUsageFlagBits::eVertexBuffer |
+			vk::BufferUsageFlagBits::eStorageBuffer |
+			vk::BufferUsageFlagBits::eShaderDeviceAddress)
+		.setSharingMode(vk::SharingMode::eExclusive),
+		ai);
+	std::memcpy(vertexBuffer.getAllocation().getInfo().pMappedData, vertices, sizeof(vertices));
+	vertexAddress = device.getBufferAddress(vk::BufferDeviceAddressInfo{}.setBuffer(*vertexBuffer));
+
+	// 索引：同样走 BDA
+	indexBuffer = allocator.createBuffer(
+		vk::BufferCreateInfo{}
+		.setSize(sizeof(indices))
+		.setUsage(vk::BufferUsageFlagBits::eIndexBuffer |
+			vk::BufferUsageFlagBits::eStorageBuffer |
+			vk::BufferUsageFlagBits::eShaderDeviceAddress)
+		.setSharingMode(vk::SharingMode::eExclusive),
+		ai);
+	std::memcpy(indexBuffer.getAllocation().getInfo().pMappedData, indices, sizeof(indices));
+	indexAddress = device.getBufferAddress(vk::BufferDeviceAddressInfo{}.setBuffer(*indexBuffer));
+}
+
+void Renderer::CreateDepthBuffer()
+{
+	constexpr auto range = vk::ImageSubresourceRange{}
+	                       .setAspectMask(vk::ImageAspectFlagBits::eDepth)
+	                       .setBaseMipLevel(0).setLevelCount(1)
+	                       .setBaseArrayLayer(0).setLayerCount(1);
+
+	constexpr auto ai = vma::AllocationCreateInfo{}.setUsage(vma::MemoryUsage::eAutoPreferDevice);
+
+	depthImage = allocator.createImage(
+		vk::ImageCreateInfo{}
+		.setImageType(vk::ImageType::e2D)
+		.setFormat(vk::Format::eD32Sfloat) // 只要深度，不要 stencil
+		.setExtent({extent.width, extent.height, 1}) // ★ 与 swapchain 同尺寸
+		.setMipLevels(1).setArrayLayers(1)
+		.setSamples(vk::SampleCountFlagBits::e1)
+		.setTiling(vk::ImageTiling::eOptimal)
+		.setUsage(vk::ImageUsageFlagBits::eDepthStencilAttachment)
+		.setSharingMode(vk::SharingMode::eExclusive)
+		.setInitialLayout(vk::ImageLayout::eUndefined),
+		ai);
+
+	depthView = vk::raii::ImageView{
+		device, vk::ImageViewCreateInfo{}
+		        .setImage(*depthImage)
+		        .setViewType(vk::ImageViewType::e2D)
+		        .setFormat(vk::Format::eD32Sfloat)
+		        .setSubresourceRange(range)
+	};
+}
+
 void Renderer::CreateTexture()
 {
 	// 2x2 棋盘：左上/右下白，右上/左下黑（RGBA8）
@@ -681,19 +795,19 @@ void Renderer::CreateTextureDescriptors()
 	// pool：必须带 UPDATE_AFTER_BIND，容量 >= 实际数量
 	constexpr auto poolSize = vk::DescriptorPoolSize{}
 	                          .setType(vk::DescriptorType::eCombinedImageSampler)
-	                          .setDescriptorCount(textureCount);
+	                          .setDescriptorCount(maxTextures);
 
 	texturePool = vk::raii::DescriptorPool{
 		device, vk::DescriptorPoolCreateInfo{}
 		        .setFlags(vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind |
-		                  vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet)
+			        vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet)
 		        .setMaxSets(1)
 		        .setPoolSizes(poolSize)
 	};
 
 	// 用 variableDescriptorCount 声明"实际用几个槽"（setBindingFlags 那类 API 要具名变量）
 	const auto countInfo = vk::DescriptorSetVariableDescriptorCountAllocateInfo{}
-		.setDescriptorCounts(textureCount);
+		.setDescriptorCounts(maxTextures);
 
 	const auto allocInfo = vk::DescriptorSetAllocateInfo{}
 	                       .setDescriptorPool(*texturePool)
@@ -759,32 +873,43 @@ void Renderer::CreatePipeline()
 	                     .setStageFlags(vk::ShaderStageFlagBits::eVertex |
 		                     vk::ShaderStageFlagBits::eFragment)
 	                     .setOffset(0)
-	                     .setSize(sizeof(vk::DeviceAddress)); // 8
+	                     .setSize(sizeof(PushConstants));
 
 	pipelineLayout = vk::raii::PipelineLayout{
 		device, vk::PipelineLayoutCreateInfo{}
 		        .setSetLayouts(*textureSetLayout) // ★ set 0 = 纹理数组（bindless）
 		        .setPushConstantRanges(pcr)
 	};
+	// 在 pcr 附近加
+	constexpr auto dssci = vk::PipelineDepthStencilStateCreateInfo{}
+	                       .setDepthTestEnable(true)
+	                       .setDepthWriteEnable(true)
+	                       .setDepthCompareOp(vk::CompareOp::eLess); // 近的赢
+
 
 	vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> chain;
 
-	auto& gp = chain.get<vk::GraphicsPipelineCreateInfo>();
-	gp.setStages(stages) // 值版：stageCount 由容器长度推导
-	  .setPVertexInputState(&vin)
-	  .setPInputAssemblyState(&ia)
-	  .setPViewportState(&vp)
-	  .setPRasterizationState(&rs)
-	  .setPMultisampleState(&ms)
-	  .setPColorBlendState(&cb)
-	  .setPDynamicState(&dsci)
-	  .setLayout(*pipelineLayout);
+	chain.get<vk::GraphicsPipelineCreateInfo>().setStages(stages) // 值版：stageCount 由容器长度推导
+	     .setPVertexInputState(&vin)
+	     .setPDepthStencilState(&dssci)
+	     .setPInputAssemblyState(&ia)
+	     .setPViewportState(&vp)
+	     .setPRasterizationState(&rs)
+	     .setPMultisampleState(&ms)
+	     .setPColorBlendState(&cb)
+	     .setPDynamicState(&dsci)
+	     .setLayout(*pipelineLayout);
 
 	chain.get<vk::PipelineRenderingCreateInfo>()
 	     .setColorAttachmentCount(1)
-	     .setPColorAttachmentFormats(&format);
+	     .setPColorAttachmentFormats(&format)
+	     .setDepthAttachmentFormat(vk::Format::eD32Sfloat);
 
-	pipeline = vk::raii::Pipeline{device, nullptr, chain.get<vk::GraphicsPipelineCreateInfo>()};
+	const auto pc = vk::raii::PipelineCache{device, vk::PipelineCacheCreateInfo{}};
+
+	Logger->Log("pipeline cache = {}", static_cast<void*>(*pc)); // 看是否非 0
+	pipeline = vk::raii::Pipeline{device, pc, chain.get<vk::GraphicsPipelineCreateInfo>()};
+	Logger->Log("graphics pipeline created."); // 没打出来就说明崩在这行
 }
 
 void Renderer::RenderGUI()
@@ -792,6 +917,10 @@ void Renderer::RenderGUI()
 	ImGui::ShowDemoWindow();
 	ImGui::ColorEdit4("Color Edit", Colors);
 	ImGui::SliderFloat4("Color", Colors, 0.0f, 1.0f);
+
+	ImGui::SeparatorText("Camera");
+	ImGui::SliderFloat("Fov (deg)", &cameraFov, 10.0f, 120.0f);
+	ImGui::SliderFloat("Distance", &cameraDistance, 0.5f, 20.0f);
 }
 
 void Renderer::Process()
@@ -802,6 +931,20 @@ void Renderer::Process()
 	const auto delta = (std::chrono::system_clock::now() - start).count() * 0.000001f;
 	const auto angle = delta * glm::pi<float>() / 30;
 
-	data.mvp = glm::rotate(glm::identity<glm::mat4>(), angle, glm::vec3(0.0f, 0.0f, 1.0f));
-	data.color = glm::vec4(1.0f);
+	// model：旋转
+	const auto model = glm::rotate(glm::identity<glm::mat4>(), angle, glm::vec3(0.0f, 1.0f, 0.0f));
+
+	// view：相机沿 +Z 看原点，距离可调，up = +Y
+	const auto view = glm::lookAt(glm::vec3(0.0f, 0.0f, cameraDistance),
+	                              glm::vec3(0.0f),
+	                              glm::vec3(0.0f, 1.0f, 0.0f));
+
+	// projection：GLM_FORCE_DEPTH_ZERO_TO_ONE 已定义（z ∈ [0,1]）；
+	// Vulkan 的 NDC 是 y 向下，所以翻转 proj 的 [1][1]
+	const auto aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+	auto proj = glm::perspective(glm::radians(cameraFov), aspect, 0.1f, 100.0f);
+	proj[1][1] *= -1.0f;
+
+	data.mvp = proj * view * model;
+	data.color = glm::vec4(Colors[0] / 2, Colors[1] / 2, Colors[2] / 2, Colors[3]);
 }
