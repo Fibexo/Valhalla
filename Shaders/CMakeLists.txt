@@ -36,6 +36,6 @@ endforeach ()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/Generated/Shaders.g.h" "${SHADER_INCLUDES}")
 
 
-add_library(Shaders STATIC ${SHADER_HEADERS} ${CMAKE_CURRENT_BINARY_DIR}/Generated/Shaders.g.h Sources/Shaders.hpp Sources/Shaders.cpp)
+add_library(Shaders SHARED ${SHADER_HEADERS} ${CMAKE_CURRENT_BINARY_DIR}/Generated/Shaders.g.h Sources/Shaders.hpp Sources/Shaders.cpp)
 target_include_directories(Shaders PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/Generated/"
         PUBLIC Sources)

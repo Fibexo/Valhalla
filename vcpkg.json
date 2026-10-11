@@ -1,0 +1,22 @@
+{
+  "name": "valhalla",
+  "version-string": "1.0.0",
+  "builtin-baseline": "0bc1a55f422ceb190877234b3ba88c372f04c485",
+  "dependencies": [
+    {
+      "name": "glm"
+    },
+    {
+      "name": "imgui"
+    },
+    {
+      "name": "sdl3"
+    },
+    {
+      "name": "vulkan"
+    },
+    {
+      "name": "vulkan-memory-allocator-hpp"
+    }
+  ]
+}
