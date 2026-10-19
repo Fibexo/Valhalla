@@ -1,7 +1,12 @@
-cmake_minimum_required(VERSION 4.1.2)
+cmake_minimum_required(VERSION 4.0.0)
 project(Valhalla LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 23)
+if (MSVC)
+    set(CMAKE_CXX_STANDARD 23)
+    add_compile_options(/std:c++latest)
+else ()
+    set(CMAKE_CXX_STANDARD 26)
+endif ()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

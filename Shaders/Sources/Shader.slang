@@ -1,40 +1,63 @@
 struct RenderData
 {
-    float4x4 mvp;
+    float4x4 m;
+    float4x4 v;
+    float4x4 p;
     float4 color;
-    uint textureIndex;
+
+    float3 light_color;
+    float3 light_dir;
+
+    uint texture_index;
 };
 
 struct Vertex{
-    float4 position;
+    float3 position;
+    float3 normal;
     float2 uv;
 };
 
 struct PushConstants
 {
-    RenderData* data;
-    Vertex* vertices;
-    uint* indices;
+    uint64_t data_address;
+    uint64_t vertices_address;
+    uint64_t indices_address;
 };
 
 [[vk::push_constant]]
 PushConstants pc;
 
-// bindless：运行时长度不定的纹理数组（runtimeDescriptorArray）
 [[vk::binding(0, 0)]]
 Sampler2D textures[];
 
-static float4 light;
-
 [shader("vertex")]
-float4 vsMain(uint id : SV_VertexID, uint iid : SV_InstanceID, out Vertex v) : SV_Position
+float4 vsMain(uint id : SV_VertexID, uint iid : SV_InstanceID, out Vertex vertex) : SV_Position
 {
-    v = pc.vertices[pc.indices[id]];
-    return mul(pc.data->mvp, v.position);
+    RenderData data = *(RenderData*)pc.data_address;
+    uint *indices = (uint*)pc.indices_address;
+    Vertex *vertices = (Vertex*)pc.vertices_address;
+
+    vertex = vertices[indices[id]];
+    vertex.position = mul(data.m, float4(vertex.position,1.0)).xyz;
+    vertex.normal = mul(data.m, float4(vertex.normal,1.0)).xyz;
+
+    return mul(data.p,mul(data.v,float4(vertex.position,1.0)));
 }
 
 [shader("fragment")]
-float4 fsMain(in Vertex v) : SV_Target
+float4 fsMain(in Vertex vertex) : SV_Target
 {
-    return textures[pc.data->textureIndex].Sample(v.uv) * pc.data->color;
+    RenderData data = *(RenderData*)pc.data_address;
+    uint *indices = (uint*)pc.indices_address;
+
+    float3 obj_color = (textures[data.texture_index].Sample(vertex.uv) * data.color).xyz;
+
+    float ambient_strength = 0.1f;
+    float diffuse_strength = max(dot(vertex.normal, normalize(data.light_dir)), 0.0);
+
+    float3 ambient = ambient_strength * data.light_color;
+    float3 diffuse = diffuse_strength * data.light_color;
+    float3 result = (ambient+diffuse) * obj_color;
+
+    return float4(result,1.0f);
 }

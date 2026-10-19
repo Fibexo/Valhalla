@@ -4,6 +4,8 @@ find_package(imgui CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(unofficial-vulkan-memory-allocator-hpp CONFIG REQUIRED)
 
+file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" VULKAN_SDK_DIR)
+
 file(GLOB_RECURSE MODULES CONFIGURE_DEPENDS Sources/*.cppm)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS Sources/*.cpp)
 
@@ -16,7 +18,9 @@ target_sources(Core
         FILES ${MODULES})
 
 target_link_libraries(Core PUBLIC Shaders
-        Vulkan::Vulkan Vulkan::Headers unofficial::VulkanMemoryAllocator-Hpp::VulkanMemoryAllocator-Hpp
-        imgui::imgui glm::glm)
+        Vulkan::Vulkan unofficial::VulkanMemoryAllocator-Hpp::VulkanMemoryAllocator-Hpp
+        imgui::imgui)
 target_include_directories(Core PUBLIC
-        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include/vma")
+        "${VULKAN_SDK_DIR}/Include"
+        "${VULKAN_SDK_DIR}/Include/vma"
+)

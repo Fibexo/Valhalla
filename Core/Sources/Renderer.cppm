@@ -2,9 +2,9 @@ module;
 
 #include <atomic>
 #include <vector>
+#include <chrono>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
-#include <chrono>
 #include <glm/glm.hpp>
 #include <glm/ext.hpp>
 
@@ -17,6 +17,10 @@ export module Renderer;
 
 import Logger;
 import PushStructures;
+import Abstractions.Mesh;
+import Abstractions.Device;
+import Shaders;
+import Abstractions.Instance;
 
 export class SurfaceSource
 {
@@ -46,11 +50,11 @@ export class Renderer
 	vk::Extent2D extent{};
 
 	vk::raii::CommandPool commandPool{nullptr};
-	std::vector<vk::raii::CommandBuffer> commandBuffers{};
-	vk::raii::Semaphore imageAvailable{nullptr}; // 二值：acquireNextImage 用
-	vk::raii::Semaphore renderTimeline{nullptr}; // timeline：帧间同步
-	std::vector<vk::raii::Semaphore> renderFinished; // 每图一个二值：presentKHR 用
-	uint64_t submitted{0}; // timeline 已信号的值
+	vk::raii::CommandBuffers commandBuffers{nullptr};
+	vk::raii::Semaphore imageAvailable{nullptr};
+	vk::raii::Semaphore renderTimeline{nullptr};
+	std::vector<vk::raii::Semaphore> renderFinished;
+	uint64_t submitted{0};
 
 	vk::raii::PipelineLayout pipelineLayout{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
@@ -66,27 +70,26 @@ export class Renderer
 	std::array<RenderData*, maxFrameInFlight> mappedMemory{};
 	std::array<vk::DeviceAddress, maxFrameInFlight> bufferAddress{};
 
-	vma::raii::Buffer vertexBuffer{nullptr};
-	vma::raii::Buffer indexBuffer{nullptr};
-	vk::DeviceAddress vertexAddress{0};
-	vk::DeviceAddress indexAddress{0};
-
 	vma::raii::Image depthImage{nullptr};
 	vk::raii::ImageView depthView{nullptr};
+
+	Mesh mesh{nullptr};
 
 	vma::raii::Image textureImage{nullptr};
 	vk::raii::ImageView textureView{nullptr};
 	vk::raii::Sampler textureSampler{nullptr};
-	static constexpr uint32_t maxTextures = 1024; // bindless 数组上限
+	static constexpr uint32_t maxTextures = 1024;
 	vk::raii::DescriptorSetLayout textureSetLayout{nullptr};
 	vk::raii::DescriptorPool texturePool{nullptr};
 	vk::raii::DescriptorSet textureSet{nullptr};
 
-	// 相机参数（ImGui 里实时调）
 	float cameraFov{45.0f};
-	float cameraDistance{3.0f};
+	float cameraDistance{5.0f};
 
-	float Colors[4] = {0.2f, 0.35f, 0.4f, 1.0f};
+	float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+	float lightColor[3] = {0.2f, 0.35f, 0.4f};
+	float lightDirection[3] = {0.2f, 0.35f, 0.4f};
+	RenderData data{};
 
 public:
 	explicit Renderer(SurfaceSource& surfaceSource) : surfaceSource(surfaceSource)
@@ -97,7 +100,7 @@ public:
 		CreateSwapchain();
 		CreateAllocator();
 		CreateBuffers();
-		CreateVertexBuffer();
+		mesh = Mesh{allocator};
 		CreateDepthBuffer();
 		CreateTexture();
 		CreateTextureSetLayout();
@@ -125,7 +128,6 @@ private:
 	void CreateSwapchain();
 	void CreateAllocator();
 	void CreateBuffers();
-	void CreateVertexBuffer();
 	void CreateDepthBuffer();
 	void CreateTexture();
 	void CreateTextureSetLayout();
@@ -137,11 +139,9 @@ private:
 	void Process();
 };
 
-#include "Shaders.hpp"
-
 void Renderer::Render()
 {
-	if (device == nullptr) { return; }
+	if (static_cast<vk::Device>(device) == nullptr) { return; }
 	if (surface == nullptr) { CreateSurface(); }
 	if (swapchain == nullptr) { ResetSwapchain(); }
 
@@ -202,7 +202,7 @@ void Renderer::Render()
 	                              .setLoadOp(vk::AttachmentLoadOp::eClear)
 	                              .setStoreOp(vk::AttachmentStoreOp::eStore)
 	                              .setClearValue(vk::ClearValue{
-		                              vk::ClearColorValue{Colors[0], Colors[1], Colors[2], Colors[3]}
+		                              vk::ClearColorValue{0.0f, 0.0f, 0.0f, 1.0f}
 	                              });
 	const auto depth_attachment = vk::RenderingAttachmentInfo{}
 	                              .setImageView(*depthView)
@@ -251,20 +251,19 @@ void Renderer::Render()
 	command.pushConstants<PushConstants>(*pipelineLayout, vk::ShaderStageFlagBits::eVertex |
 	                                     vk::ShaderStageFlagBits::eFragment, 0,
 	                                     PushConstants{
-		                                     .data = reinterpret_cast<RenderData*>(bufferAddress[currentSlot()]),
-		                                     .vertices = reinterpret_cast<Vertex*>(vertexAddress),
-		                                     .indices = reinterpret_cast<glm::uint*>(indexAddress)
+		                                     .data_address = (bufferAddress[currentSlot()]),
+		                                     .vertices_address = (mesh.GetVertexAddress()),
+		                                     .indices_address = (mesh.GetIndexAddress())
 	                                     });
 	command.setViewport(0, vp);
 	command.setScissor(0, vk::Rect2D{{0, 0}, extent});
 
-	command.draw(36, 1, 0, 0);
+	mesh.Draw(command);
 
 	ImGui::NewFrame();
 	RenderGUI();
 	ImGui::Render();
 	ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), *command);
-
 
 	command.endRendering();
 	command.pipelineBarrier2(end_di);
@@ -298,8 +297,8 @@ void Renderer::Render()
 	          .setImageIndices(image_index);
 
 	const vk::Result present_result = queue.presentKHR(pi);
-	if (present_result == vk::Result::eErrorOutOfDateKHR ||
-		present_result == vk::Result::eSuboptimalKHR)
+	if (present_result == vk::Result::eErrorOutOfDateKHR /*||
+		present_result == vk::Result::eSuboptimalKHR*/)
 	{
 		ResetSwapchain();
 		return;
@@ -374,12 +373,12 @@ void Renderer::CreateInstance()
 		"VK_LAYER_KHRONOS_validation"
 #endif
 	};
-	instance = {
-		context, vk::InstanceCreateInfo{}
-		         .setPApplicationInfo(&ai)
-		         .setPEnabledExtensionNames(surfaceSource.RequiredInstanceExtensions())
-		         .setPEnabledLayerNames(layers)
-	};
+	instance = context.createInstance(
+		vk::InstanceCreateInfo{}
+		.setPApplicationInfo(&ai)
+		.setPEnabledExtensionNames(surfaceSource.RequiredInstanceExtensions())
+		.setPEnabledLayerNames(layers)
+	);
 }
 
 void Renderer::CreateSurface()
@@ -406,8 +405,9 @@ void Renderer::InitializeDevice()
 	}
 
 
-	auto priorities = {1.0f};
-	auto extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+	constexpr auto priorities = 1.0f;
+	constexpr auto extensions = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+	constexpr auto features = vk::PhysicalDeviceFeatures{}.setShaderInt64(true);
 
 	device = {
 		physicalDevice,
@@ -418,7 +418,8 @@ void Renderer::InitializeDevice()
 				.setQueueFamilyIndex(queueFamily)
 				.setQueuePriorities(priorities)
 			)
-			.setPEnabledExtensionNames(extensions),
+			.setPEnabledExtensionNames(extensions)
+			.setPEnabledFeatures(&features),
 			vk::PhysicalDeviceVulkan11Features{}
 			.setShaderDrawParameters(true),
 			vk::PhysicalDeviceVulkan12Features{}
@@ -429,7 +430,8 @@ void Renderer::InitializeDevice()
 			.setDescriptorBindingSampledImageUpdateAfterBind(true)
 			.setDescriptorBindingPartiallyBound(true)
 			.setDescriptorBindingVariableDescriptorCount(true)
-			.setRuntimeDescriptorArray(true),
+			.setRuntimeDescriptorArray(true)
+			.setScalarBlockLayout(true),
 			vk::PhysicalDeviceVulkan13Features{}
 			.setDynamicRendering(true)
 			.setSynchronization2(true)
@@ -437,12 +439,11 @@ void Renderer::InitializeDevice()
 	};
 	queue = {device, queueFamily, 0};
 
-	commandPool = {
-		device,
+	commandPool = device.createCommandPool(
 		vk::CommandPoolCreateInfo{}
 		.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
 		.setQueueFamilyIndex(queueFamily)
-	};
+	);
 
 	commandBuffers = device.allocateCommandBuffers(
 		vk::CommandBufferAllocateInfo{}
@@ -451,14 +452,13 @@ void Renderer::InitializeDevice()
 		.setCommandBufferCount(maxFrameInFlight)
 	);
 
-	imageAvailable = {device, vk::SemaphoreCreateInfo{}};
-	renderTimeline = {
-		device, vk::SemaphoreCreateInfo{}.setPNext(
+	imageAvailable = device.createSemaphore({});
+	renderTimeline = device.createSemaphore(
+		vk::SemaphoreCreateInfo{}.setPNext(
 			vk::SemaphoreTypeCreateInfo{}
 			.setSemaphoreType(vk::SemaphoreType::eTimeline)
-			.setInitialValue(0)
-		)
-	};
+			.setInitialValue(0))
+	);
 }
 
 void Renderer::CreateSwapchain()
@@ -505,8 +505,7 @@ void Renderer::CreateSwapchain()
 		composite_alpha = vk::CompositeAlphaFlagBitsKHR::ePreMultiplied;
 	}
 
-	swapchain = {
-		device,
+	swapchain = device.createSwapchainKHR(
 		vk::SwapchainCreateInfoKHR{}
 		.setSurface(surface)
 		.setMinImageCount(image_count)
@@ -519,7 +518,8 @@ void Renderer::CreateSwapchain()
 		.setPresentMode(vk::PresentModeKHR::eFifo)
 		.setClipped(true)
 		.setCompositeAlpha(composite_alpha)
-	};
+	);
+
 	images = swapchain.getImages();
 	layouts.assign(images.size(), vk::ImageLayout::eUndefined);
 
@@ -527,19 +527,20 @@ void Renderer::CreateSwapchain()
 	renderFinished.clear();
 	for (const auto& image : images)
 	{
-		views.emplace_back(device, vk::ImageViewCreateInfo{}
-		                           .setImage(image)
-		                           .setViewType(vk::ImageViewType::e2D)
-		                           .setFormat(format)
-		                           .setSubresourceRange(vk::ImageSubresourceRange{}
-		                                                .setAspectMask(vk::ImageAspectFlagBits::eColor)
-		                                                .setBaseMipLevel(0)
-		                                                .setLevelCount(1)
-		                                                .setBaseArrayLayer(0)
-		                                                .setLayerCount(1)
-		                           )
+		views.emplace_back(device.createImageView(
+				vk::ImageViewCreateInfo{}
+				.setImage(image)
+				.setViewType(vk::ImageViewType::e2D)
+				.setFormat(format)
+				.setSubresourceRange(
+					vk::ImageSubresourceRange{}
+					.setAspectMask(vk::ImageAspectFlagBits::eColor)
+					.setBaseMipLevel(0)
+					.setLevelCount(1)
+					.setBaseArrayLayer(0)
+					.setLayerCount(1)))
 		);
-		renderFinished.emplace_back(device, vk::SemaphoreCreateInfo{});
+		renderFinished.emplace_back(device.createSemaphore({}));
 	}
 }
 
@@ -548,14 +549,13 @@ void Renderer::CreateAllocator()
 	// 结构体本身有链式 setter（vk_mem_alloc_structs.hpp 里 115 个），照 vulkan.hpp 风格写
 	// 注意：instance / device / pVulkanFunctions 不能设 —— createAllocator 会自己填，
 	//       设了会命中它的校验并抛 eErrorValidationFailed
-	allocator = vma::raii::Allocator{
-		instance,
-		device,
+	allocator = vma::raii::createAllocator(
+		instance, device,
 		vma::AllocatorCreateInfo{}
 		.setFlags(vma::AllocatorCreateFlagBits::eBufferDeviceAddress)
 		.setPhysicalDevice(*physicalDevice)
 		.setVulkanApiVersion(VK_API_VERSION_1_4)
-	};
+	);
 }
 
 void Renderer::CreateBuffers()
@@ -576,55 +576,6 @@ void Renderer::CreateBuffers()
 		mappedMemory[i] = static_cast<RenderData*>(buffers[i].getAllocation().getInfo().pMappedData);
 		bufferAddress[i] = device.getBufferAddress(vk::BufferDeviceAddressInfo{}.setBuffer(*buffers[i]));
 	}
-}
-
-void Renderer::CreateVertexBuffer()
-{
-	// 24 顶点：每面 4 个（左下→右下→右上→左上），UV 覆盖 0..1
-	constexpr Vertex vertices[24] = {
-		{{1, -1, -1, 1}, {0, 1}}, {{1, -1, 1, 1}, {1, 1}}, {{1, 1, 1, 1}, {1, 0}}, {{1, 1, -1, 1}, {0, 0}}, // +X
-		{{-1, -1, 1, 1}, {0, 1}}, {{-1, -1, -1, 1}, {1, 1}}, {{-1, 1, -1, 1}, {1, 0}}, {{-1, 1, 1, 1}, {0, 0}}, // -X
-		{{-1, 1, -1, 1}, {0, 1}}, {{1, 1, -1, 1}, {1, 1}}, {{1, 1, 1, 1}, {1, 0}}, {{-1, 1, 1, 1}, {0, 0}}, // +Y
-		{{-1, -1, 1, 1}, {0, 1}}, {{1, -1, 1, 1}, {1, 1}}, {{1, -1, -1, 1}, {1, 0}}, {{-1, -1, -1, 1}, {0, 0}}, // -Y
-		{{-1, -1, 1, 1}, {0, 1}}, {{1, -1, 1, 1}, {1, 1}}, {{1, 1, 1, 1}, {1, 0}}, {{-1, 1, 1, 1}, {0, 0}}, // +Z
-		{{1, -1, -1, 1}, {0, 1}}, {{-1, -1, -1, 1}, {1, 1}}, {{-1, 1, -1, 1}, {1, 0}}, {{1, 1, -1, 1}, {0, 0}}, // -Z
-	};
-
-	// 36 索引：每面 2 个三角形
-	constexpr uint32_t indices[36] = {
-		0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7,
-		8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15,
-		16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
-	};
-
-	vma::AllocationCreateInfo ai{};
-	ai.usage = vma::MemoryUsage::eAuto;
-	ai.flags = vma::AllocationCreateFlagBits::eHostAccessSequentialWrite |
-		vma::AllocationCreateFlagBits::eMapped;
-
-	// 顶点：BDA 读，所以要 ShaderDeviceAddress
-	vertexBuffer = allocator.createBuffer(
-		vk::BufferCreateInfo{}
-		.setSize(sizeof(vertices))
-		.setUsage(vk::BufferUsageFlagBits::eVertexBuffer |
-			vk::BufferUsageFlagBits::eStorageBuffer |
-			vk::BufferUsageFlagBits::eShaderDeviceAddress)
-		.setSharingMode(vk::SharingMode::eExclusive),
-		ai);
-	std::memcpy(vertexBuffer.getAllocation().getInfo().pMappedData, vertices, sizeof(vertices));
-	vertexAddress = device.getBufferAddress(vk::BufferDeviceAddressInfo{}.setBuffer(*vertexBuffer));
-
-	// 索引：同样走 BDA
-	indexBuffer = allocator.createBuffer(
-		vk::BufferCreateInfo{}
-		.setSize(sizeof(indices))
-		.setUsage(vk::BufferUsageFlagBits::eIndexBuffer |
-			vk::BufferUsageFlagBits::eStorageBuffer |
-			vk::BufferUsageFlagBits::eShaderDeviceAddress)
-		.setSharingMode(vk::SharingMode::eExclusive),
-		ai);
-	std::memcpy(indexBuffer.getAllocation().getInfo().pMappedData, indices, sizeof(indices));
-	indexAddress = device.getBufferAddress(vk::BufferDeviceAddressInfo{}.setBuffer(*indexBuffer));
 }
 
 void Renderer::CreateDepthBuffer()
@@ -649,21 +600,21 @@ void Renderer::CreateDepthBuffer()
 		.setInitialLayout(vk::ImageLayout::eUndefined),
 		ai);
 
-	depthView = vk::raii::ImageView{
-		device, vk::ImageViewCreateInfo{}
-		        .setImage(*depthImage)
-		        .setViewType(vk::ImageViewType::e2D)
-		        .setFormat(vk::Format::eD32Sfloat)
-		        .setSubresourceRange(range)
-	};
+	depthView = device.createImageView(
+		vk::ImageViewCreateInfo{}
+		.setImage(*depthImage)
+		.setViewType(vk::ImageViewType::e2D)
+		.setFormat(vk::Format::eD32Sfloat)
+		.setSubresourceRange(range)
+	);
 }
 
 void Renderer::CreateTexture()
 {
-	// 2x2 棋盘：左上/右下白，右上/左下黑（RGBA8）
+	// 2x2 棋盘（RGBA8 逆向）
 	constexpr uint32_t pixels[4] = {
-		0xFFFFFFFF, 0xFF000000,
-		0xFF000000, 0xFFFFFFFF,
+		0xFF0000FF, 0xFF00FF00,
+		0xFFFF0000, 0xFF00FFFF,
 	};
 	constexpr vk::DeviceSize imageSize = sizeof(pixels); // 16
 
@@ -745,22 +696,22 @@ void Renderer::CreateTexture()
 	// staging 是 vma::raii::Buffer，离开作用域自动销毁
 
 	// view + sampler
-	textureView = vk::raii::ImageView{
-		device, vk::ImageViewCreateInfo{}
-		        .setImage(textureImage)
-		        .setViewType(vk::ImageViewType::e2D)
-		        .setFormat(vk::Format::eR8G8B8A8Unorm)
-		        .setSubresourceRange(range)
-	};
+	textureView = device.createImageView(
+		vk::ImageViewCreateInfo{}
+		.setImage(textureImage)
+		.setViewType(vk::ImageViewType::e2D)
+		.setFormat(vk::Format::eR8G8B8A8Unorm)
+		.setSubresourceRange(range)
+	);
 
-	textureSampler = vk::raii::Sampler{
-		device, vk::SamplerCreateInfo{}
-		        .setMagFilter(vk::Filter::eNearest)
-		        .setMinFilter(vk::Filter::eNearest)
-		        .setAddressModeU(vk::SamplerAddressMode::eRepeat)
-		        .setAddressModeV(vk::SamplerAddressMode::eRepeat)
-		        .setAddressModeW(vk::SamplerAddressMode::eRepeat)
-	};
+	textureSampler = device.createSampler(
+		vk::SamplerCreateInfo{}
+		.setMagFilter(vk::Filter::eNearest)
+		.setMinFilter(vk::Filter::eNearest)
+		.setAddressModeU(vk::SamplerAddressMode::eRepeat)
+		.setAddressModeV(vk::SamplerAddressMode::eRepeat)
+		.setAddressModeW(vk::SamplerAddressMode::eRepeat)
+	);
 }
 
 void Renderer::CreateTextureSetLayout()
@@ -784,7 +735,7 @@ void Renderer::CreateTextureSetLayout()
 	                  .setFlags(vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool) // ★ 必须
 	                  .setBindings(binding);
 
-	textureSetLayout = vk::raii::DescriptorSetLayout{device, info};
+	textureSetLayout = device.createDescriptorSetLayout(info);
 	Logger->Log("Texture set layout created (bindless, {} max).", maxTextures);
 }
 
@@ -797,13 +748,13 @@ void Renderer::CreateTextureDescriptors()
 	                          .setType(vk::DescriptorType::eCombinedImageSampler)
 	                          .setDescriptorCount(maxTextures);
 
-	texturePool = vk::raii::DescriptorPool{
-		device, vk::DescriptorPoolCreateInfo{}
-		        .setFlags(vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind |
-			        vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet)
-		        .setMaxSets(1)
-		        .setPoolSizes(poolSize)
-	};
+	texturePool = device.createDescriptorPool(
+		vk::DescriptorPoolCreateInfo{}
+		.setFlags(vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind |
+			vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet)
+		.setMaxSets(1)
+		.setPoolSizes(poolSize)
+	);
 
 	// 用 variableDescriptorCount 声明"实际用几个槽"（setBindingFlags 那类 API 要具名变量）
 	const auto countInfo = vk::DescriptorSetVariableDescriptorCountAllocateInfo{}
@@ -835,8 +786,8 @@ void Renderer::CreateTextureDescriptors()
 
 void Renderer::CreatePipeline()
 {
-	vk::raii::ShaderModule vert{device, vk::ShaderModuleCreateInfo{}.setCode(Shaders::ShaderVertex)};
-	vk::raii::ShaderModule frag{device, vk::ShaderModuleCreateInfo{}.setCode(Shaders::ShaderFragment)};
+	vk::raii::ShaderModule vert{device, vk::ShaderModuleCreateInfo{}.setCode(Shaders::GetShader("ShaderVertex"))};
+	vk::raii::ShaderModule frag{device, vk::ShaderModuleCreateInfo{}.setCode(Shaders::GetShader("ShaderFragment"))};
 
 	const std::vector stages{
 		vk::PipelineShaderStageCreateInfo{}
@@ -875,11 +826,11 @@ void Renderer::CreatePipeline()
 	                     .setOffset(0)
 	                     .setSize(sizeof(PushConstants));
 
-	pipelineLayout = vk::raii::PipelineLayout{
-		device, vk::PipelineLayoutCreateInfo{}
-		        .setSetLayouts(*textureSetLayout) // ★ set 0 = 纹理数组（bindless）
-		        .setPushConstantRanges(pcr)
-	};
+	pipelineLayout = device.createPipelineLayout(
+		vk::PipelineLayoutCreateInfo{}
+		.setSetLayouts(*textureSetLayout) // ★ set 0 = 纹理数组（bindless）
+		.setPushConstantRanges(pcr)
+	);
 	// 在 pcr 附近加
 	constexpr auto dssci = vk::PipelineDepthStencilStateCreateInfo{}
 	                       .setDepthTestEnable(true)
@@ -905,18 +856,19 @@ void Renderer::CreatePipeline()
 	     .setPColorAttachmentFormats(&format)
 	     .setDepthAttachmentFormat(vk::Format::eD32Sfloat);
 
-	const auto pc = vk::raii::PipelineCache{device, vk::PipelineCacheCreateInfo{}};
+	const auto pc = device.createPipelineCache({});
 
 	Logger->Log("pipeline cache = {}", static_cast<void*>(*pc)); // 看是否非 0
-	pipeline = vk::raii::Pipeline{device, pc, chain.get<vk::GraphicsPipelineCreateInfo>()};
+	pipeline = device.createGraphicsPipeline(pc, chain.get());
 	Logger->Log("graphics pipeline created."); // 没打出来就说明崩在这行
 }
 
 void Renderer::RenderGUI()
 {
 	ImGui::ShowDemoWindow();
-	ImGui::ColorEdit4("Color Edit", Colors);
-	ImGui::SliderFloat4("Color", Colors, 0.0f, 1.0f);
+	ImGui::ColorEdit4("Color", color);
+	ImGui::ColorEdit3("Light Color", lightColor);
+	ImGui::SliderFloat3("Light Direction", lightDirection, -1.0f, 1.0f);
 
 	ImGui::SeparatorText("Camera");
 	ImGui::SliderFloat("Fov (deg)", &cameraFov, 10.0f, 120.0f);
@@ -927,12 +879,13 @@ void Renderer::Process()
 {
 	static const auto start = std::chrono::system_clock::now();
 
-	auto& data = *mappedMemory[currentSlot()];
 	const auto delta = (std::chrono::system_clock::now() - start).count() * 0.000001f;
 	const auto angle = delta * glm::pi<float>() / 30;
 
 	// model：旋转
-	const auto model = glm::rotate(glm::identity<glm::mat4>(), angle, glm::vec3(0.0f, 1.0f, 0.0f));
+	const auto model =
+		glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 1.0f, 0.0f)) *
+		glm::rotate(glm::mat4(1.0f), angle / 2, glm::vec3(1.0f, 0.0f, 0.0f));
 
 	// view：相机沿 +Z 看原点，距离可调，up = +Y
 	const auto view = glm::lookAt(glm::vec3(0.0f, 0.0f, cameraDistance),
@@ -945,6 +898,12 @@ void Renderer::Process()
 	auto proj = glm::perspective(glm::radians(cameraFov), aspect, 0.1f, 100.0f);
 	proj[1][1] *= -1.0f;
 
-	data.mvp = proj * view * model;
-	data.color = glm::vec4(Colors[0] / 2, Colors[1] / 2, Colors[2] / 2, Colors[3]);
+	data.m = model;
+	data.v = view;
+	data.p = proj;
+	data.color = {color[0], color[1], color[2], color[3]};
+	data.light_color = {lightColor[0], lightColor[1], lightColor[2]};
+	data.light_dir = {lightDirection[0], lightDirection[1], lightDirection[2]};
+
+	*mappedMemory[currentSlot()] = data;
 }

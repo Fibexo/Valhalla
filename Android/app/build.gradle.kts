@@ -1,19 +1,9 @@
 plugins {
     id("com.android.application")
 }
-
-val vcpkgRoot = System.getenv("VCPKG_ROOT")?.replace('\\', '/')
-val androidHome = System.getenv("ANDROID_HOME")?.replace('\\', '/')
-val ndkVersionName = "30.0.16248370"
-val vcpkgToolchain = "$vcpkgRoot/scripts/buildsystems/vcpkg.cmake"
-val ndkToolchain = "$androidHome/ndk/$ndkVersionName/build/cmake/android.toolchain.cmake"
-
 android {
     namespace = "com.fibexo.valhalla"
-    compileSdk {
-        version = release(37)
-    }
-    ndkVersion = ndkVersionName
+    compileSdk = 37
 
 
     defaultConfig {
@@ -21,22 +11,10 @@ android {
         minSdk = 28
         targetSdk = 36
         versionCode = 1
-        versionName = "1.0"
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        externalNativeBuild {
-            cmake {
-                arguments += listOf(
-                    "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain",
-                    "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$ndkToolchain",
-                    "-DVCPKG_TARGET_TRIPLET=arm64-android-dynamic",
-                    "-DANDROID_PLATFORM=android-37",
-                    "-DANDROID_STL=c++_shared",
-                )
-                abiFilters += "arm64-v8a"
-            }
-        }
     }
     buildFeatures { prefab = true }
 
@@ -51,12 +29,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("../../CMakeLists.txt")
-            version = "4.1.2+"
-        }
-    }
 }
 
 dependencies {

@@ -21,6 +21,7 @@ tmp/
 /Android/app/build/
 /Android/app/.cxx/
 /Android/local.properties
+/Android/app/src/main/jniLibs/arm64-v8a/*
 *.apk
 # 注意：Android/app/libs/SDL3-*.aar 是构建必需的依赖，故意不忽略
 
